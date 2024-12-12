@@ -31,25 +31,30 @@ CURLcode curl_ws_send(CURL *curl, const void *buffer, size_t buflen,
 
 # DESCRIPTION
 
-Send the specific message fragment over an established WebSocket
-connection. The *buffer* holds the data to send and it is *buflen*
-number of payload bytes in that memory area.
+Send the specific message chunk over an established WebSocket
+connection. *buffer* must point to a valid memory location containing
+(at least) *buflen* bytes of payload memory.
 
-*sent* is returned as the number of payload bytes actually sent.
+*sent* is set to the number of payload bytes actually sent. If *sent* is less
+than the given *buflen*, libcurl was unable to consume the complete payload
+in a single invocation. In this case the application must call this function
+again  until all payload is processed. *buffer* and *buflen* must be adjusted
+on every following invocation to only point to the remaining piece of the
+payload.
 
-To send a (huge) fragment using multiple calls with partial content per
-invoke, set the *CURLWS_OFFSET* bit and the *fragsize* argument as the
-total expected size for the first part, then set the *CURLWS_OFFSET* with
-a zero *fragsize* for the following parts.
+*fragsize* should always be set to zero unless a (huge) frame shall be sent
+using multiple calls with partial content per call explicitly. In that
+case you must set the *CURLWS_OFFSET* bit and set the *fragsize* as documented
+in the section on *CURLWS_OFFSET* below.
 
-If not sending a partial fragment or if this is raw mode, *fragsize*
-should be set to zero.
+*flags* must contain at least one flag indicating the type of the message.
+To send a fragmented message consisting of multiple frames, additionally set
+the *CURLWS_CONT* bit in all frames except the final one.
 
-If **CURLWS_RAW_MODE** is enabled in CURLOPT_WS_OPTIONS(3), the
-**flags** argument should be set to 0.
+For more details on the supported flags see below and in curl_ws_meta(3).
 
-To send a message consisting of multiple frames, set the *CURLWS_CONT* bit
-in all frames except the final one.
+If *CURLWS_RAW_MODE* is enabled in CURLOPT_WS_OPTIONS(3), the
+*flags* argument should be set to 0.
 
 Warning: while it is possible to invoke this function from a callback,
 such a call is blocking in this situation, e.g. only returns after all data
@@ -57,39 +62,15 @@ has been sent or an error is encountered.
 
 # FLAGS
 
-## CURLWS_TEXT
-
-The buffer contains text data. Note that this makes a difference to WebSocket
-but libcurl itself does not make any verification of the content or
-precautions that you actually send valid UTF-8 content.
-
-## CURLWS_BINARY
-
-This is binary data.
-
-## CURLWS_CONT
-
-This is not the final fragment of the message, which implies that there is
-another fragment coming as part of the same message where this bit is not set.
-
-## CURLWS_CLOSE
-
-Close this transfer.
-
-## CURLWS_PING
-
-This is a ping.
-
-## CURLWS_PONG
-
-This is a pong.
+Supports all flags documented in curl_ws_meta(3) and additionally the following
+flags.
 
 ## CURLWS_OFFSET
 
-The provided data is only a partial fragment and there is more coming in a
+The provided data is only a partial frame and there is more coming in a
 following call to *curl_ws_send()*. When sending only a piece of the
-fragment like this, the *fragsize* must be provided with the total
-expected fragment size in the first call and it needs to be zero in subsequent
+frame like this, the *fragsize* must be provided with the total
+expected frame size in the first call and must be zero in all subsequent
 calls.
 
 # %PROTOCOLS%
@@ -99,18 +80,29 @@ calls.
 ~~~c
 #include <string.h> /* for strlen */
 
-const char *send_payload = "magic";
+const char *buffer = "magic";
 
 int main(void)
 {
   size_t sent;
+  size_t sent_total = 0;
   CURLcode res;
   CURL *curl = curl_easy_init();
+  
   curl_easy_setopt(curl, CURLOPT_URL, "wss://example.com/");
   curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 2L);
   curl_easy_perform(curl);
-  res = curl_ws_send(curl, send_payload, strlen(send_payload), &sent, 0,
-                     CURLWS_PING);
+  
+  while (res && buflen > 0) {
+    res = curl_ws_send(curl, buffer + sent_total, strlen(buffer) - sent_total,
+                       &sent, 0, CURLWS_PING);
+    sent_total += sent;
+    if(res == CURLE_AGAIN) {
+      /* .. wait for socket here ... */
+      res = CURLE_OK;
+    }
+  }
+  
   curl_easy_cleanup(curl);
   return (int)res;
 }
@@ -120,6 +112,13 @@ int main(void)
 
 # RETURN VALUE
 
-*CURLE_OK* (zero) means that the data was sent properly, non-zero means an
-error occurred as *\<curl/curl.h\>* defines. See the libcurl-errors(3) man
-page for the full list with descriptions.
+Returns **CURLE_OK** if everything is okay. This is also the case when only
+parts of the *buffer* have been processed (*sent* < *buflen*). The application
+must check *sent* to determine whether the complete frame has been sent.
+
+Instead of blocking, the function returns **CURLE_AGAIN**. The correct
+behavior is then to wait for the socket to signal readability before calling
+this function again.
+
+Any other non-zero return value indicates an error. See the libcurl-errors(3)
+man page for the full list with descriptions.

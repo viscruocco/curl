@@ -30,36 +30,66 @@ CURLcode curl_ws_recv(CURL *curl, void *buffer, size_t buflen,
 
 # DESCRIPTION
 
-Retrieves as much as possible of a received WebSocket data fragment into the
-**buffer**, but not more than **buflen** bytes. *recv* is set to the
+Retrieves as much as possible of a received WebSocket frame into the
+*buffer*, but not more than *buflen* bytes. *recv* is set to the
 number of bytes actually stored.
 
-If there is more fragment data to deliver than what fits in the provided
-*buffer*, libcurl returns a full buffer and the application needs to call this
-function again to continue draining the buffer.
+If there is more frame data to deliver than what got written during this call,
+the application needs to call this function again to resume receiving. This
+may for example happen when the data doesn't fit into the provided *buffer* or
+when not all frame data has been delivered over the network yet.
 
 If the function call is successful, the *meta* pointer gets set to point to a
 *const struct curl_ws_frame* that contains information about the received
 data. That struct must not be freed and its contents must not be relied upon
-anymore once another WebSocket function is called. See the curl_ws_meta(3) for
-details on that struct.a
+anymore once another WebSocket function is called. See curl_ws_meta(3) for more
+details on that struct.
 
-# %PROTOCOLS%
+If the application wants to read the metadata without consuming any payload,
+it may call this function with a *buflen* of zero. Setting *buffer* to a NULL
+pointer is permitted in this case. Note that frames without payload will be
+consumed by this action.
+
+If the received message consists of multiple fragments, the *CURLWS_CONT* bit
+is set in all frames except the final one. The application is responsible for
+reassembling fragmented messages. See curl_ws_meta(3) for more details on
+*CURLWS_CONT*.
+
+# %PROTOCOLS% 
 
 # EXAMPLE
 
 ~~~c
 int main(void)
 {
-  size_t rlen;
+  size_t recv;
+  size_t recv_total = 0;
   const struct curl_ws_frame *meta;
   char buffer[256];
+  CURLcode res;
   CURL *curl = curl_easy_init();
-  if(curl) {
-    CURLcode res = curl_ws_recv(curl, buffer, sizeof(buffer), &rlen, &meta);
-    if(res)
-      printf("error: %s\n", curl_easy_strerror(res));
-  }
+  
+  curl_easy_setopt(curl, CURLOPT_URL, "wss://example.com/");
+  curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 2L);
+  curl_easy_perform(curl);
+  
+  /* Note: This example neglects fragmented messages. (CURLWS_CONT bit)
+           A real application must handle them appropriately. */
+  
+  do {
+    res = curl_ws_recv(curl, buffer + recv_total, sizeof(buffer) - recv_total,
+                       &recv, &meta);
+    recv_total += recv;
+    if(meta->bytesleft > sizeof(buffer) - recv_total)
+      res = CURLE_TOO_LARGE;
+    if(res == CURLE_AGAIN) {
+      /* .. wait for socket here ... */
+      res = CURLE_OK;
+    }
+  } while(res && meta->bytesleft > 0);
+
+  curl_easy_cleanup(curl);
+  return (int)res;
 }
 ~~~
 
@@ -67,10 +97,16 @@ int main(void)
 
 # RETURN VALUE
 
-Returns **CURLE_OK** if everything is okay, and a non-zero number for
-errors. Returns **CURLE_GOT_NOTHING** if the associated connection is
-closed.
+Returns **CURLE_OK** if everything is okay. This is also the case when only
+parts of a frame have been written to the buffer. The application must check
+`meta->bytesleft` to determine when the complete frame has been received.
 
 Instead of blocking, the function returns **CURLE_AGAIN**. The correct
 behavior is then to wait for the socket to signal readability before calling
 this function again.
+
+Any other non-zero return value indicates an error. See the libcurl-errors(3)
+man page for the full list with descriptions.
+
+Returns **CURLE_GOT_NOTHING** if the associated connection is closed.
+
