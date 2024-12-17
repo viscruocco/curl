@@ -46,8 +46,8 @@
 #include "memdebug.h"
 
 
-#define WSBIT_FIN 0x80
-#define WSBIT_OPCODE_CONT  0
+#define WSBIT_FIN (0x80)
+#define WSBIT_OPCODE_CONT  (0)
 #define WSBIT_OPCODE_TEXT  (1)
 #define WSBIT_OPCODE_BIN   (2)
 #define WSBIT_OPCODE_CLOSE (8)
@@ -61,51 +61,73 @@
 #define WS_CHUNK_SIZE 65535
 #define WS_CHUNK_COUNT 2
 
-struct ws_frame_meta {
-  char proto_opcode;
-  int flags;
-  const char *name;
-};
-
-static struct ws_frame_meta WS_FRAMES[] = {
-  { WSBIT_OPCODE_CONT,  CURLWS_CONT,   "CONT" },
-  { WSBIT_OPCODE_TEXT,  CURLWS_TEXT,   "TEXT" },
-  { WSBIT_OPCODE_BIN,   CURLWS_BINARY, "BIN" },
-  { WSBIT_OPCODE_CLOSE, CURLWS_CLOSE,  "CLOSE" },
-  { WSBIT_OPCODE_PING,  CURLWS_PING,   "PING" },
-  { WSBIT_OPCODE_PONG,  CURLWS_PONG,   "PONG" },
-};
-
-static const char *ws_frame_name_of_op(unsigned char proto_opcode)
+static const char *ws_frame_name_of_op(unsigned char firstbyte)
 {
-  unsigned char opcode = proto_opcode & WSBIT_OPCODE_MASK;
-  size_t i;
-  for(i = 0; i < sizeof(WS_FRAMES)/sizeof(WS_FRAMES[0]); ++i) {
-    if(WS_FRAMES[i].proto_opcode == opcode)
-      return WS_FRAMES[i].name;
+  switch(firstbyte & WSBIT_OPCODE_MASK) {
+    case WSBIT_OPCODE_CONT:
+      return "CONT";
+    case WSBIT_OPCODE_TEXT:
+      return "TEXT";
+    case WSBIT_OPCODE_BIN:
+      return "BIN";
+    case WSBIT_OPCODE_CLOSE:
+      return "CLOSE";
+    case WSBIT_OPCODE_PING:
+      return "PING";
+    case WSBIT_OPCODE_PONG:
+      return "PONG";
+    default:
+      return "???";
   }
-  return "???";
 }
 
-static int ws_frame_op2flags(unsigned char proto_opcode)
+static int ws_frame_firstbyte2flags(unsigned char firstbyte, int cont_flags)
 {
-  unsigned char opcode = proto_opcode & WSBIT_OPCODE_MASK;
-  size_t i;
-  for(i = 0; i < sizeof(WS_FRAMES)/sizeof(WS_FRAMES[0]); ++i) {
-    if(WS_FRAMES[i].proto_opcode == opcode)
-      return WS_FRAMES[i].flags;
+  switch(firstbyte) {
+    case WSBIT_OPCODE_CONT:
+      return cont_flags | CURLWS_CONT;
+    case (WSBIT_OPCODE_CONT | WSBIT_FIN):
+      return cont_flags & ~CURLWS_CONT;
+    case WSBIT_OPCODE_TEXT:
+      return CURLWS_TEXT | CURLWS_CONT;
+    case (WSBIT_OPCODE_TEXT | WSBIT_FIN):
+      return CURLWS_TEXT;
+    case WSBIT_OPCODE_BIN:
+      return CURLWS_BINARY | CURLWS_CONT;
+    case (WSBIT_OPCODE_BIN | WSBIT_FIN):
+      return CURLWS_BINARY;
+    case (WSBIT_OPCODE_CLOSE | WSBIT_FIN):
+      return CURLWS_CLOSE;
+    case (WSBIT_OPCODE_PING | WSBIT_FIN):
+      return CURLWS_PING;
+    case (WSBIT_OPCODE_PONG | WSBIT_FIN):
+      return CURLWS_PONG;
+    default:
+      return 0;
   }
-  return 0;
 }
 
-static unsigned char ws_frame_flags2op(int flags)
+static unsigned char ws_frame_flags2firstbyte(unsigned int flags, bool contfragment, CURLcode *err)
 {
-  size_t i;
-  for(i = 0; i < sizeof(WS_FRAMES)/sizeof(WS_FRAMES[0]); ++i) {
-    if(WS_FRAMES[i].flags & flags)
-      return (unsigned char)WS_FRAMES[i].proto_opcode;
+  switch(flags & (CURLWS_CONT | CURLWS_TEXT | CURLWS_BINARY | CURLWS_CLOSE | CURLWS_PING | CURLWS_PONG)) {
+    case CURLWS_TEXT:
+      return contfragment ? (WSBIT_OPCODE_CONT | WSBIT_FIN) : (WSBIT_OPCODE_TEXT | WSBIT_FIN);
+    case (CURLWS_TEXT | CURLWS_CONT):
+      return contfragment ? WSBIT_OPCODE_CONT : WSBIT_OPCODE_TEXT;
+    case CURLWS_BINARY:
+      return contfragment ? (WSBIT_OPCODE_CONT | WSBIT_FIN) : (WSBIT_OPCODE_BIN | WSBIT_FIN);
+    case (CURLWS_BINARY | CURLWS_CONT):
+      return contfragment ? WSBIT_OPCODE_CONT : WSBIT_OPCODE_BIN;
+    case CURLWS_CLOSE:
+      return WSBIT_OPCODE_CLOSE | WSBIT_FIN;
+    case CURLWS_PING:
+      return WSBIT_OPCODE_PING | WSBIT_FIN;
+    case CURLWS_PONG:
+      return WSBIT_OPCODE_PONG | WSBIT_FIN;
+    default:
+      *err = CURLE_SEND_ERROR;
+      return -1;
   }
-  return 0;
 }
 
 static void ws_dec_info(struct ws_decoder *dec, struct Curl_easy *data,
@@ -156,11 +178,13 @@ static void ws_dec_reset(struct ws_decoder *dec)
   dec->payload_len = 0;
   dec->head_len = dec->head_total = 0;
   dec->state = WS_DEC_INIT;
+  /* dec->cont_flags is carried over from frame to frame */
 }
 
 static void ws_dec_init(struct ws_decoder *dec)
 {
   ws_dec_reset(dec);
+  dec->cont_flags = 0;
 }
 
 static CURLcode ws_dec_read_head(struct ws_decoder *dec,
@@ -175,12 +199,19 @@ static CURLcode ws_dec_read_head(struct ws_decoder *dec,
       dec->head[0] = *inbuf;
       Curl_bufq_skip(inraw, 1);
 
-      dec->frame_flags = ws_frame_op2flags(dec->head[0]);
+      dec->frame_flags = ws_frame_firstbyte2flags(dec->head[0], dec->cont_flags);
       if(!dec->frame_flags) {
         failf(data, "WS: unknown opcode: %x", dec->head[0]);
         ws_dec_reset(dec);
         return CURLE_RECV_ERROR;
       }
+
+      if(dec->frame_flags & CURLWS_CONT) {
+        dec->cont_flags = dec->frame_flags;
+      } else {
+        dec->cont_flags = 0;
+      }
+
       dec->head_len = 1;
       /* ws_dec_info(dec, data, "seeing opcode"); */
       continue;
@@ -492,10 +523,8 @@ static const struct Curl_cwtype ws_cw_decode = {
 static void ws_enc_info(struct ws_encoder *enc, struct Curl_easy *data,
                         const char *msg)
 {
-  infof(data, "WS-ENC: %s [%s%s%s payload=%" FMT_OFF_T "/%" FMT_OFF_T "]",
+  infof(data, "WS-ENC: %s [%s%s payload=%" FMT_OFF_T "/%" FMT_OFF_T "]",
         msg, ws_frame_name_of_op(enc->firstbyte),
-        (enc->firstbyte & WSBIT_OPCODE_MASK) == WSBIT_OPCODE_CONT ?
-        " CONT" : "",
         (enc->firstbyte & WSBIT_FIN) ? "" : " NON-FIN",
         enc->payload_len - enc->payload_remain, enc->payload_len);
 }
@@ -543,7 +572,6 @@ static ssize_t ws_enc_write_head(struct Curl_easy *data,
                                  CURLcode *err)
 {
   unsigned char firstbyte = 0;
-  unsigned char opcode;
   unsigned char head[14];
   size_t hlen;
   ssize_t n;
@@ -563,35 +591,18 @@ static ssize_t ws_enc_write_head(struct Curl_easy *data,
     return -1;
   }
 
-  opcode = ws_frame_flags2op((int)flags & ~CURLWS_CONT);
-  if(!opcode) {
-    failf(data, "WS: provided flags not recognized '%x'", flags);
-    *err = CURLE_SEND_ERROR;
+  firstbyte = ws_frame_flags2firstbyte(flags, enc->contfragment, err);
+  if(*err) {
+    failf(data, "WS: provided flags not valid '%x'", flags);
     return -1;
   }
 
-  if(!(flags & CURLWS_CONT)) {
-    if(!enc->contfragment)
-      /* not marked as continuing, this is the final fragment */
-      firstbyte |= WSBIT_FIN | opcode;
-    else
-      /* marked as continuing, this is the final fragment; set CONT
-         opcode and FIN bit */
-      firstbyte |= WSBIT_FIN | WSBIT_OPCODE_CONT;
-
-    enc->contfragment = FALSE;
-  }
-  else if(enc->contfragment) {
-    /* the previous fragment was not a final one and this is not either, keep a
-       CONT opcode and no FIN bit */
-    firstbyte |= WSBIT_OPCODE_CONT;
-  }
-  else {
-    firstbyte = opcode;
-    enc->contfragment = TRUE;
+  if(flags & (CURLWS_TEXT | CURLWS_BINARY)) {
+    enc->contfragment = (flags & CURLWS_CONT);
   }
 
   head[0] = enc->firstbyte = firstbyte;
+
   if(payload_len > 65535) {
     head[1] = 127 | WSBIT_MASK;
     head[2] = (unsigned char)((payload_len >> 56) & 0xff);
@@ -778,8 +789,8 @@ CURLcode Curl_ws_accept(struct Curl_easy *data,
   }
   else {
     Curl_bufq_reset(&ws->recvbuf);
-    ws_dec_reset(&ws->dec);
-    ws_enc_reset(&ws->enc);
+    ws_dec_init(&ws->dec);
+    ws_enc_init(&ws->enc);
   }
   /* Verify the Sec-WebSocket-Accept response.
 
